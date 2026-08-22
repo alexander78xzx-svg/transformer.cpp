@@ -1,5 +1,7 @@
 #include <iostream>
 #include <fstream>
+#include <vector>
+#include <limits>
 
 struct Tokenizer
 {
@@ -115,7 +117,7 @@ void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
     }
 
     tokenizer->vocab_size = vocab_size;
-    file.read(reinterpret_cast<char*>(tokenizer), sizeof(Tokenizer));
+    file.read(reinterpret_cast<char*>(&tokenizer->max_token_length), sizeof(int));
 
     tokenizer->scores = new float[vocab_size];
     tokenizer->len_token = new int[vocab_size];
@@ -131,6 +133,61 @@ void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
     }
 
 }
+
+std::vector<int> encode(std::string input, Tokenizer* tokenizer, Weights* weights ) { // to optimize
+    input = " " + input;
+    std::vector<int> tokens;
+
+    std::vector<std::string> chars;
+    for (char c : input) {
+        chars.push_back(std::string(1,c));
+    }
+
+    while (chars.size() > 1 ) {
+        float max = -std::numeric_limits<float>::infinity();;
+        int idx = -1;
+        std::string combination;
+
+        for( int i = 0; i < chars.size()-1 ; i++){
+            std::string concated = std::string( chars[i] + chars[i + 1]);
+
+            for (int j = 0; j < tokenizer->vocab_size; j++){
+                if( tokenizer->vocab[j] == concated){
+                    if( tokenizer->scores[j] > max) {
+                        max = tokenizer->scores[j];
+                        idx = i;
+                        combination = concated;
+                    }
+                }
+            }
+        }
+        if (idx== -1) break; 
+
+        chars[idx] += chars[idx + 1];
+        chars.erase(chars.begin() + idx +1);
+    }
+
+    for (int i = 0; i < chars.size(); i++){
+        std::cout<<chars[i];
+    }
+    std::cout<<std::endl;
+    
+    for (int i = 0; i<chars.size() ; i ++){
+        for(int j = 0; j < tokenizer->vocab_size; j++){
+            if( tokenizer->vocab[j] == chars[i]) tokens.push_back(j);
+        }
+    }
+
+    for (int i = 0; i < tokens.size(); i++){
+        std::cout<<tokens[i] << " ";
+    }
+    std::cout<<std::endl;
+    return tokens;
+}
+
+std::vector<std::vector<float>> embedTokens( std::vector<int>* tokens, Weights* weights ) {
+}
+
 int main() {
     // load binaries in the memory
 
@@ -141,6 +198,9 @@ int main() {
     Tokenizer tokenizer;
     loadTokenizer(&tokenizer, config.vocab_size);
 
-    std::cout << config.dim << std::endl;
+    std::string input = "the cat is sleeping on the couch.";
+    std::vector<int> tokenizedInput = encode(input, &tokenizer, &weights);
+
+
     return 0;
 }
