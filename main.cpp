@@ -2,6 +2,7 @@
 #include <fstream>
 #include <vector>
 #include <limits>
+#include <unordered_map>
 
 struct Tokenizer
 {
@@ -13,6 +14,8 @@ struct Tokenizer
     int* len_token;
     float* scores;
     char** vocab;
+
+    std::unordered_map<std::string, int> hash_map;
 };
 
 struct Config
@@ -122,6 +125,7 @@ void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
     tokenizer->scores = new float[vocab_size];
     tokenizer->len_token = new int[vocab_size];
     tokenizer->vocab = new char*[vocab_size];
+    tokenizer->hash_map.reserve(vocab_size);
 
     for (int i = 0; i < vocab_size; i++) {
         file.read(reinterpret_cast<char*>(&tokenizer->scores[i]), sizeof(float));
@@ -130,17 +134,36 @@ void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
         tokenizer->vocab[i] = new char[tokenizer->len_token[i] + 1];
         file.read(tokenizer->vocab[i], tokenizer->len_token[i]);
         tokenizer->vocab[i][tokenizer->len_token[i]] = '\0'; // null-terminate string
+
+        tokenizer->hash_map.emplace(tokenizer->vocab[i], i);
     }
 
 }
 
-std::vector<int> encode(std::string input, Tokenizer* tokenizer, Weights* weights ) { // to optimize
-    input = " " + input;
+std::vector<int> encode(std::string input, Tokenizer* tokenizer) { // to optimize
     std::vector<int> tokens;
 
-    std::vector<std::string> chars;
+    std::string processed = "\xe2\x96\x81";
     for (char c : input) {
-        chars.push_back(std::string(1,c));
+    if (c == ' ') {
+        processed += "\xe2\x96\x81";
+    } else {
+        processed += c;
+    }
+}
+
+    tokens.push_back(1); // Beginning of sequence token
+
+    std::vector<std::string> chars;
+
+    for (size_t i = 0; i < processed.size(); ) {
+        if ((unsigned char)processed[i] == 0xe2 && i + 2 < processed.size()) {
+            chars.push_back(processed.substr(i, 3));
+            i += 3;
+        } else {
+            chars.push_back(std::string(1, processed[i]));
+            i += 1;
+        }
     }
 
     while (chars.size() > 1 ) {
@@ -151,14 +174,13 @@ std::vector<int> encode(std::string input, Tokenizer* tokenizer, Weights* weight
         for( int i = 0; i < chars.size()-1 ; i++){
             std::string concated = std::string( chars[i] + chars[i + 1]);
 
-            for (int j = 0; j < tokenizer->vocab_size; j++){
-                if( tokenizer->vocab[j] == concated){
-                    if( tokenizer->scores[j] > max) {
-                        max = tokenizer->scores[j];
-                        idx = i;
-                        combination = concated;
-                    }
-                }
+            auto it = tokenizer->hash_map.find(concated);
+            if (it != tokenizer->hash_map.end()){
+                if( tokenizer->scores[it->second] > max) {
+                    max = tokenizer->scores[it->second];
+                    idx = i;
+                    combination = concated;
+                }  
             }
         }
         if (idx== -1) break; 
@@ -171,10 +193,11 @@ std::vector<int> encode(std::string input, Tokenizer* tokenizer, Weights* weight
         std::cout<<chars[i];
     }
     std::cout<<std::endl;
-    
-    for (int i = 0; i<chars.size() ; i ++){
-        for(int j = 0; j < tokenizer->vocab_size; j++){
-            if( tokenizer->vocab[j] == chars[i]) tokens.push_back(j);
+
+    for (size_t i = 0; i < chars.size(); i++) {
+        auto it = tokenizer->hash_map.find(chars[i]);
+        if (it != tokenizer->hash_map.end()) {
+            tokens.push_back(it->second);
         }
     }
 
@@ -185,7 +208,19 @@ std::vector<int> encode(std::string input, Tokenizer* tokenizer, Weights* weight
     return tokens;
 }
 
-std::vector<std::vector<float>> embedTokens( std::vector<int>* tokens, Weights* weights ) {
+std::vector<std::vector<float>> embedTokens( std::vector<int>* tokens, Weights* weights, Config *config ) {
+    std::vector<std::vector<float>> embeded;
+    for(int i = 0; i<tokens->size(); i++){
+
+        std::vector<float> temp;
+        int start = (*tokens)[i] * config->dim;
+        int end = start + config->dim;
+        for(int j = start; j < end; j++){
+            temp.push_back( weights->token_embedding_table[j] );
+        }
+        embeded.push_back(temp);
+    }
+    return embeded;
 }
 
 int main() {
@@ -198,9 +233,17 @@ int main() {
     Tokenizer tokenizer;
     loadTokenizer(&tokenizer, config.vocab_size);
 
-    std::string input = "the cat is sleeping on the couch.";
-    std::vector<int> tokenizedInput = encode(input, &tokenizer, &weights);
+    std::string input = "Once upon a time";
+    std::vector<int> encodedInput = encode(input, &tokenizer);
 
+    std::vector<std::vector<float>> tokenizedInput = embedTokens(&encodedInput, &weights, &config );
+
+    /*
+    for(int i = 0; i < tokenizedInput.size(); i++){
+        for(int j = 0; j < config.dim; j++){
+            std::cout<<tokenizedInput[i][j] << std::endl;
+        }
+    } */
 
     return 0;
 }
