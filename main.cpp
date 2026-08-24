@@ -3,6 +3,8 @@
 #include <vector>
 #include <limits>
 #include <unordered_map>
+#include <cmath>
+#include <cstring>
 
 struct Tokenizer
 {
@@ -48,6 +50,15 @@ struct Weights
 
     float* rms_final_weight;
     float* wcls;
+};
+
+struct State {
+    int* input_tokens;
+    int n_tokens;
+    float* embeded_input;
+
+    float* x;
+    float* x_buffer;
 };
 
 void loadWeights( Weights *weights, Config *config) {
@@ -140,19 +151,16 @@ void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
 
 }
 
-std::vector<int> encode(std::string input, Tokenizer* tokenizer) { // to optimize
-    std::vector<int> tokens;
-
+void encode(std::string input, Tokenizer* tokenizer, State* state) { // to optimize
+    
     std::string processed = "\xe2\x96\x81";
     for (char c : input) {
-    if (c == ' ') {
-        processed += "\xe2\x96\x81";
-    } else {
-        processed += c;
+        if (c == ' ') {
+            processed += "\xe2\x96\x81";
+        } else {
+            processed += c;
+        }
     }
-}
-
-    tokens.push_back(1); // Beginning of sequence token
 
     std::vector<std::string> chars;
 
@@ -167,7 +175,7 @@ std::vector<int> encode(std::string input, Tokenizer* tokenizer) { // to optimiz
     }
 
     while (chars.size() > 1 ) {
-        float max = -std::numeric_limits<float>::infinity();;
+        float max = -std::numeric_limits<float>::infinity();
         int idx = -1;
         std::string combination;
 
@@ -194,33 +202,57 @@ std::vector<int> encode(std::string input, Tokenizer* tokenizer) { // to optimiz
     }
     std::cout<<std::endl;
 
+    state->n_tokens = 0;
+    state->input_tokens = new int[chars.size() + 1];
+
+    state->input_tokens[state->n_tokens] = 1;
+    state->n_tokens++;
+
     for (size_t i = 0; i < chars.size(); i++) {
         auto it = tokenizer->hash_map.find(chars[i]);
         if (it != tokenizer->hash_map.end()) {
-            tokens.push_back(it->second);
+            state->input_tokens[state->n_tokens] = it->second;
+            state->n_tokens++;
         }
+  
     }
 
-    for (int i = 0; i < tokens.size(); i++){
-        std::cout<<tokens[i] << " ";
+    // output
+    for (int i = 0; i < state->n_tokens; i++){
+        std::cout << state->input_tokens[i] << std::endl;
     }
     std::cout<<std::endl;
-    return tokens;
 }
 
-std::vector<std::vector<float>> embedTokens( std::vector<int>* tokens, Weights* weights, Config *config ) {
-    std::vector<std::vector<float>> embeded;
-    for(int i = 0; i<tokens->size(); i++){
+void embedTokens( Weights* weights, Config *config, State* state ) {
+    state->embeded_input = new float[state->n_tokens * config->dim];
 
-        std::vector<float> temp;
-        int start = (*tokens)[i] * config->dim;
-        int end = start + config->dim;
-        for(int j = start; j < end; j++){
-            temp.push_back( weights->token_embedding_table[j] );
-        }
-        embeded.push_back(temp);
+    float* ptr = state->embeded_input;
+
+    for(int i = 0; i< state->n_tokens; i++){
+        float* src = weights->token_embedding_table + ((size_t)state->input_tokens[i] * config->dim);
+
+        std::memcpy(ptr, src, config->dim * sizeof(float));
+
+        ptr += config->dim;
     }
-    return embeded;
+}
+
+void rmsNorm(float* weights, Config *config, float* x, float* xb){
+    
+    float rms_scalar = 0.f;
+
+    for(int i = 0; i<config->dim; i++){
+        rms_scalar += x[i] * x[i];
+    }
+    rms_scalar = rms_scalar / config->dim;
+    rms_scalar += 0.00001;
+    rms_scalar = std::sqrt(rms_scalar);
+    rms_scalar = 1 / rms_scalar;
+
+    for(int i = 0; i<config->dim; i++){
+        xb[i] = x[i] * rms_scalar * weights[i];
+    }
 }
 
 int main() {
@@ -233,10 +265,12 @@ int main() {
     Tokenizer tokenizer;
     loadTokenizer(&tokenizer, config.vocab_size);
 
-    std::string input = "Once upon a time";
-    std::vector<int> encodedInput = encode(input, &tokenizer);
+    State state;
 
-    std::vector<std::vector<float>> tokenizedInput = embedTokens(&encodedInput, &weights, &config );
+    std::string input = "Once upon a time";
+    encode(input, &tokenizer, &state);
+
+    embedTokens(&weights, &config, &state);
 
     /*
     for(int i = 0; i < tokenizedInput.size(); i++){
