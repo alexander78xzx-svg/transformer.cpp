@@ -59,6 +59,9 @@ struct State {
 
     float* x;
     float* x_buffer;
+    float* q;
+    float* k;
+    float* v;
 };
 
 void loadWeights( Weights *weights, Config *config) {
@@ -253,10 +256,62 @@ void rmsNorm(float* weights, Config *config, float* x, float* xb){
     for(int i = 0; i<config->dim; i++){
         xb[i] = x[i] * rms_scalar * weights[i];
     }
+
+
+}
+
+void matmul(float* out, float* x, float* w, int n_out, int n_in) {
+    for (int i = 0; i < n_out; i++) {
+        float sum = 0.0f;
+        for (int j = 0; j < n_in; j++) {
+            sum += w[i * n_in + j] * x[j];
+        }
+        out[i] = sum;
+    }
+}
+
+void computeQKV(float* wq, float* wk, float* wv, Config* config , State *state){
+    int dim = config->dim;
+    int head_size = dim / config->n_heads;
+    int kv_dim = config->n_kv_heads * head_size;
+
+    matmul(state->q, state->x_buffer, wq, dim, dim);
+
+    matmul(state->k, state->x_buffer, wk, kv_dim, dim);
+    matmul(state->v, state->x_buffer, wv, kv_dim, dim);
+}
+
+void runTransformer(Weights* weights, Config* config, State* state){
+    int head_size = config->dim / config->n_heads;
+    int kv_dim = config->n_kv_heads * head_size;
+    
+    // one transformer bloc for now
+    state->x = new float[config->dim];
+    state->x_buffer = new float[config->dim];
+    state->q = new float[config->dim];
+    state->k = new float[config->dim];
+    state->v = new float[config->dim];
+
+    int layer = 0;
+
+    float* rms_weight = weights->rms_att_weight + (layer * config->dim);
+
+    float* q_layer = weights->wq + (size_t)layer * (config->dim*config->dim);
+    float* k_layer = weights->wk + (size_t)layer * (config->dim*kv_dim);
+    float* v_layer = weights->wv + (size_t)layer * (config->dim*kv_dim);
+
+    for(int i = 0; i < state->n_tokens; i++){
+        float* token_embed = state->embeded_input + (i * config->dim);
+        std::memcpy(state->x, token_embed, config->dim * sizeof(float));
+
+        rmsNorm( rms_weight, config, state->x, state->x_buffer);
+
+        computeQKV( q_layer, k_layer, v_layer, config, state );
+
+    }
 }
 
 int main() {
-    // load binaries in the memory
 
     Weights weights;
     Config config;
@@ -268,16 +323,12 @@ int main() {
     State state;
 
     std::string input = "Once upon a time";
+    
     encode(input, &tokenizer, &state);
 
     embedTokens(&weights, &config, &state);
 
-    /*
-    for(int i = 0; i < tokenizedInput.size(); i++){
-        for(int j = 0; j < config.dim; j++){
-            std::cout<<tokenizedInput[i][j] << std::endl;
-        }
-    } */
+    runTransformer(&weights, &config, &state);
 
     return 0;
 }
