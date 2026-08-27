@@ -154,7 +154,7 @@ void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
 
 }
 
-void encode(std::string input, Tokenizer* tokenizer, State* state) { // to optimize
+void encode(std::string input, Tokenizer* tokenizer, State* state) {
     
     std::string processed = "\xe2\x96\x81";
     for (char c : input) {
@@ -281,6 +281,36 @@ void computeQKV(float* wq, float* wk, float* wv, Config* config , State *state){
     matmul(state->v, state->x_buffer, wv, kv_dim, dim);
 }
 
+void applyRoPE( float* q, float* k, int pos, Config* config, State *state ){ 
+    int head_size = config->dim / config->n_heads;
+
+    for(int i = 0; i<config->n_heads; i++){
+        for( int j = 0; j< head_size ; j+=2){
+            float freq = 1.0f / pow(10000.0f, (float)j / (float)head_size); // enforce float div
+            float angle = pos * freq;
+
+            int idx = i * head_size + j;
+            float q0_temp = q[idx];
+            float q1_temp = q[idx + 1];
+            q[idx] = q0_temp * cos(angle) - q1_temp * sin(angle);
+            q[idx+1] = q0_temp * sin(angle) + q1_temp * cos(angle);
+        }
+    }
+
+    for(int i = 0; i<config->n_kv_heads; i++){
+        for( int j = 0; j< head_size ; j+=2){
+            float freq = 1.0f / pow(10000.0f, (float)j / (float)head_size);
+            float angle = pos * freq;
+
+            int idx = i * head_size + j;
+            float k0_temp = k[idx];
+            float k1_temp = k[idx + 1];
+            k[idx] = k0_temp * cos(angle) - k1_temp * sin(angle);
+            k[idx+1] = k0_temp * sin(angle) + k1_temp * cos(angle);
+        }
+    }
+}
+
 void runTransformer(Weights* weights, Config* config, State* state){
     int head_size = config->dim / config->n_heads;
     int kv_dim = config->n_kv_heads * head_size;
@@ -308,6 +338,7 @@ void runTransformer(Weights* weights, Config* config, State* state){
 
         computeQKV( q_layer, k_layer, v_layer, config, state );
 
+        applyRoPE(q_layer, k_layer, i, config, state);
     }
 }
 
