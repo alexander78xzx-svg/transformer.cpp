@@ -6,6 +6,8 @@
 #include <cmath>
 #include <cstring>
 
+using Tensor = std::vector<std::vector<float>>; // to refactor later
+
 struct Tokenizer
 {
     int max_token_length; 
@@ -52,6 +54,11 @@ struct Weights
     float* wcls;
 };
 
+struct KV_cache{
+    float* k_cache;
+    float* v_cache;
+};
+
 struct State {
     int* input_tokens;
     int n_tokens;
@@ -62,7 +69,10 @@ struct State {
     float* q;
     float* k;
     float* v;
+
+    KV_cache* kv_cache;
 };
+
 
 void loadWeights( Weights *weights, Config *config) {
     
@@ -281,7 +291,7 @@ void computeQKV(float* wq, float* wk, float* wv, Config* config , State *state){
     matmul(state->v, state->x_buffer, wv, kv_dim, dim);
 }
 
-void applyRoPE( float* q, float* k, int pos, Config* config, State *state ){ 
+void applyRoPE( float* q, float* k, int pos, Config* config){ 
     int head_size = config->dim / config->n_heads;
 
     for(int i = 0; i<config->n_heads; i++){
@@ -330,7 +340,14 @@ void runTransformer(Weights* weights, Config* config, State* state){
     float* k_layer = weights->wk + (size_t)layer * (config->dim*kv_dim);
     float* v_layer = weights->wv + (size_t)layer * (config->dim*kv_dim);
 
+    KV_cache cache;
+    cache.k_cache = new float[config->max_context_window * config->n_blocks * kv_dim];
+    cache.v_cache = new float[config->max_context_window * config->n_blocks * kv_dim];
+
+    float* wo_output = new float[config->dim];
+
     for(int i = 0; i < state->n_tokens; i++){
+
         float* token_embed = state->embeded_input + (i * config->dim);
         std::memcpy(state->x, token_embed, config->dim * sizeof(float));
 
@@ -338,9 +355,89 @@ void runTransformer(Weights* weights, Config* config, State* state){
 
         computeQKV( q_layer, k_layer, v_layer, config, state );
 
-        applyRoPE(q_layer, k_layer, i, config, state);
+        applyRoPE(state->q, state->k, i, config);
+
+
+        int block_offset = layer * config->max_context_window * kv_dim;
+        int pos_offset = i * kv_dim;
+
+        float* k_dest = cache.k_cache + block_offset + pos_offset;
+        float* v_dest = cache.v_cache + block_offset + pos_offset;
+
+        std::memcpy(k_dest, state->k, kv_dim * sizeof(float));
+        std::memcpy(v_dest, state->v, kv_dim * sizeof(float));
+
+        for(int h = 0; h < config->n_heads; h++){
+
+            float* slice_q = state->q + h * head_size;
+            int kv_head = h / (config->n_heads / config->n_kv_heads);
+
+            std::vector<float> scores = std::vector<float>(config->max_context_window);
+
+            // dot prod
+            for(int t = 0; t <= i; t++){
+                float dot_prod = 0;
+
+                float* k_head = cache.k_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
+
+                for(int j = 0; j<head_size; j++){
+                    
+                    dot_prod += slice_q[j] * k_head[j];
+                }
+                dot_prod = dot_prod / sqrt(head_size);
+                scores[t] = dot_prod;
+
+            }
+
+            // softmax
+            float max = -std::numeric_limits<float>::infinity();
+            for(int j = 0; j<=i; j++){
+                if( scores[j] > max ) { max = scores[j]; }
+            }
+            float sum_exp = 0.0;
+            for( int j = 0; j<=i; j++ ){
+                scores[j] = exp( scores[j] - max );
+                sum_exp += scores[j];
+            }
+            for(int j = 0; j<=i; j++){ scores[j] /= sum_exp; }
+
+            // clean buffer
+            float* head_offset = state->x_buffer + (head_size * h);
+            for(int j = 0; j < head_size; j++){
+                head_offset[j] = 0.0f;
+            }
+
+            // attention
+            for(int t = 0; t <= i; t++){
+                float* v_head = cache.v_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
+
+                for(int j=0; j<head_size; j++){
+                    state->x_buffer[h * head_size + j] += scores[t] * v_head[j];
+                }
+            }
+        }
+
+        // wo and add
+        float* wo_offset = weights->wo + (size_t)layer * (config->dim * config->dim);
+        matmul(wo_output,state->x_buffer,wo_offset, config->dim, config->dim);
+
+        for(int j = 0; j<config->dim; j++){
+            state->x[j] += wo_output[j]; 
+        }
+
+
     }
+    
+    delete[] state->x;
+    delete[] state->x_buffer;
+    delete[] state->q;
+    delete[] state->k;
+    delete[] state->v;
+    delete[] cache.k_cache;
+    delete[] cache.v_cache;
+    delete[] wo_output;
 }
+
 
 int main() {
 
