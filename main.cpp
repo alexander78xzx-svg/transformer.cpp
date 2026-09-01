@@ -164,7 +164,7 @@ void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
 
 }
 
-void encode(std::string input, Tokenizer* tokenizer, State* state) {
+void encode(std::string input, Tokenizer* tokenizer, State* state, Config* config) {
     
     std::string processed = "\xe2\x96\x81";
     for (char c : input) {
@@ -216,7 +216,7 @@ void encode(std::string input, Tokenizer* tokenizer, State* state) {
     std::cout<<std::endl;
 
     state->n_tokens = 0;
-    state->input_tokens = new int[chars.size() + 1];
+    state->input_tokens = new int[config->max_context_window];
 
     state->input_tokens[state->n_tokens] = 1;
     state->n_tokens++;
@@ -229,12 +229,6 @@ void encode(std::string input, Tokenizer* tokenizer, State* state) {
         }
   
     }
-
-    // output
-    for (int i = 0; i < state->n_tokens; i++){
-        std::cout << state->input_tokens[i] << std::endl;
-    }
-    std::cout<<std::endl;
 }
 
 void embedTokens( Weights* weights, Config *config, State* state ) {
@@ -321,6 +315,10 @@ void applyRoPE( float* q, float* k, int pos, Config* config){
     }
 }
 
+float SiLU(float x){
+    return x * (1 / (1 + exp(-x)));
+}
+
 void runTransformer(Weights* weights, Config* config, State* state){
     int head_size = config->dim / config->n_heads;
     int kv_dim = config->n_kv_heads * head_size;
@@ -332,102 +330,147 @@ void runTransformer(Weights* weights, Config* config, State* state){
     state->k = new float[config->dim];
     state->v = new float[config->dim];
 
-    int layer = 0;
-
-    float* rms_weight = weights->rms_att_weight + (layer * config->dim);
-
-    float* q_layer = weights->wq + (size_t)layer * (config->dim*config->dim);
-    float* k_layer = weights->wk + (size_t)layer * (config->dim*kv_dim);
-    float* v_layer = weights->wv + (size_t)layer * (config->dim*kv_dim);
-
     KV_cache cache;
     cache.k_cache = new float[config->max_context_window * config->n_blocks * kv_dim];
     cache.v_cache = new float[config->max_context_window * config->n_blocks * kv_dim];
 
+    std::vector<float> scores = std::vector<float>(config->max_context_window);
+
     float* wo_output = new float[config->dim];
+
+    float* gate_buffer = new float[config->hidden_dim];
+    float* up_buffer   = new float[config->hidden_dim];
+    float* down_buffer = new float[config->dim];
 
     for(int i = 0; i < state->n_tokens; i++){
 
-        float* token_embed = state->embeded_input + (i * config->dim);
+        int token_id = state->input_tokens[i];
+    
+        float* token_embed = weights->token_embedding_table + (token_id * config->dim);
         std::memcpy(state->x, token_embed, config->dim * sizeof(float));
 
-        rmsNorm( rms_weight, config, state->x, state->x_buffer);
+        for(int layer = 0; layer<config->n_blocks; layer++){
+            float* rms_weight_att = weights->rms_att_weight + (layer * config->dim);
+            float* rms_weight_ffn = weights->rms_ffn_weight + (layer * config->dim);
 
-        computeQKV( q_layer, k_layer, v_layer, config, state );
+            float* q_layer = weights->wq + (size_t)layer * (config->dim*config->dim);
+            float* k_layer = weights->wk + (size_t)layer * (config->dim*kv_dim);
+            float* v_layer = weights->wv + (size_t)layer * (config->dim*kv_dim);
 
-        applyRoPE(state->q, state->k, i, config);
+            rmsNorm( rms_weight_att, config, state->x, state->x_buffer);
+
+            computeQKV( q_layer, k_layer, v_layer, config, state );
+
+            applyRoPE(state->q, state->k, i, config);
 
 
-        int block_offset = layer * config->max_context_window * kv_dim;
-        int pos_offset = i * kv_dim;
+            int block_offset = layer * config->max_context_window * kv_dim;
+            int pos_offset = i * kv_dim;
 
-        float* k_dest = cache.k_cache + block_offset + pos_offset;
-        float* v_dest = cache.v_cache + block_offset + pos_offset;
+            float* k_dest = cache.k_cache + block_offset + pos_offset;
+            float* v_dest = cache.v_cache + block_offset + pos_offset;
 
-        std::memcpy(k_dest, state->k, kv_dim * sizeof(float));
-        std::memcpy(v_dest, state->v, kv_dim * sizeof(float));
+            std::memcpy(k_dest, state->k, kv_dim * sizeof(float));
+            std::memcpy(v_dest, state->v, kv_dim * sizeof(float));
 
-        for(int h = 0; h < config->n_heads; h++){
+            for(int h = 0; h < config->n_heads; h++){
 
-            float* slice_q = state->q + h * head_size;
-            int kv_head = h / (config->n_heads / config->n_kv_heads);
+                float* slice_q = state->q + h * head_size;
+                int kv_head = h / (config->n_heads / config->n_kv_heads);
 
-            std::vector<float> scores = std::vector<float>(config->max_context_window);
+                // dot prod
+                for(int t = 0; t <= i; t++){
+                    float dot_prod = 0;
 
-            // dot prod
-            for(int t = 0; t <= i; t++){
-                float dot_prod = 0;
+                    float* k_head = cache.k_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
 
-                float* k_head = cache.k_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
+                    for(int j = 0; j<head_size; j++){
+                        
+                        dot_prod += slice_q[j] * k_head[j];
+                    }
+                    dot_prod = dot_prod / sqrt(head_size);
+                    scores[t] = dot_prod;
 
-                for(int j = 0; j<head_size; j++){
-                    
-                    dot_prod += slice_q[j] * k_head[j];
                 }
-                dot_prod = dot_prod / sqrt(head_size);
-                scores[t] = dot_prod;
 
-            }
+                // softmax
+                float max = -std::numeric_limits<float>::infinity();
+                for(int j = 0; j<=i; j++){
+                    if( scores[j] > max ) { max = scores[j]; }
+                }
+                float sum_exp = 0.0;
+                for( int j = 0; j<=i; j++ ){
+                    scores[j] = exp( scores[j] - max );
+                    sum_exp += scores[j];
+                }
+                for(int j = 0; j<=i; j++){ scores[j] /= sum_exp; }
 
-            // softmax
-            float max = -std::numeric_limits<float>::infinity();
-            for(int j = 0; j<=i; j++){
-                if( scores[j] > max ) { max = scores[j]; }
-            }
-            float sum_exp = 0.0;
-            for( int j = 0; j<=i; j++ ){
-                scores[j] = exp( scores[j] - max );
-                sum_exp += scores[j];
-            }
-            for(int j = 0; j<=i; j++){ scores[j] /= sum_exp; }
+                // clean buffer
+                float* head_offset = state->x_buffer + (head_size * h);
+                for(int j = 0; j < head_size; j++){
+                    head_offset[j] = 0.0f;
+                }
 
-            // clean buffer
-            float* head_offset = state->x_buffer + (head_size * h);
-            for(int j = 0; j < head_size; j++){
-                head_offset[j] = 0.0f;
-            }
+                // attention
+                for(int t = 0; t <= i; t++){
+                    float* v_head = cache.v_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
 
-            // attention
-            for(int t = 0; t <= i; t++){
-                float* v_head = cache.v_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
-
-                for(int j=0; j<head_size; j++){
-                    state->x_buffer[h * head_size + j] += scores[t] * v_head[j];
+                    for(int j=0; j<head_size; j++){
+                        state->x_buffer[h * head_size + j] += scores[t] * v_head[j];
+                    }
                 }
             }
+
+            // wo and add
+            float* wo_offset = weights->wo + (size_t)layer * (config->dim * config->dim);
+            matmul(wo_output,state->x_buffer,wo_offset, config->dim, config->dim);
+
+            for(int j = 0; j<config->dim; j++){
+                state->x[j] += wo_output[j]; 
+            }
+
+            // pre ffn norm
+            rmsNorm(rms_weight_ffn, config, state->x, state->x_buffer);
+
+            //ffn:
+            int token = state->input_tokens[i];
+            float* w1_offset = weights->w1 + (size_t)layer * (config->dim * config->hidden_dim);
+            float* w3_offset = weights->w3 + (size_t)layer * (config->dim * config->hidden_dim);
+            float* w2_offset = weights->w2 + (size_t)layer * (config->hidden_dim * config->dim);
+
+            matmul(gate_buffer, state->x_buffer, w1_offset, config->hidden_dim, config->dim);
+            for(int j= 0; j<config->hidden_dim; j++){
+                gate_buffer[j] = SiLU(gate_buffer[j]);
+            }
+            matmul(up_buffer, state->x_buffer, w3_offset, config->hidden_dim, config->dim);
+            for(int j = 0; j<config->hidden_dim; j++){
+                gate_buffer[j] = gate_buffer[j] * up_buffer[j];
+            }
+            matmul(down_buffer,gate_buffer,w2_offset,config->dim, config->hidden_dim);
+            for(int j=0; j<config->dim; j++){
+                state->x[j] += down_buffer[j];
+            }            
         }
-
-        // wo and add
-        float* wo_offset = weights->wo + (size_t)layer * (config->dim * config->dim);
-        matmul(wo_output,state->x_buffer,wo_offset, config->dim, config->dim);
-
-        for(int j = 0; j<config->dim; j++){
-            state->x[j] += wo_output[j]; 
-        }
-
-
     }
-    
+
+    // final norm
+    float* rms_weight_final = weights->rms_final_weight;
+    rmsNorm(rms_weight_final,config,state->x, state->x_buffer);
+
+    float* logits = new float[config->vocab_size];
+    matmul(logits, state->x_buffer, weights->wcls, config->vocab_size, config->dim);
+
+    int idx = 0;
+    float max = -std::numeric_limits<float>::infinity();
+    for( int j = 0; j<config->vocab_size; j++){
+        if( logits[j] > max){
+            max = logits[j];
+            idx = j;
+        }
+    }
+    state->input_tokens[state->n_tokens] = idx;
+    state->n_tokens++;
+
     delete[] state->x;
     delete[] state->x_buffer;
     delete[] state->q;
@@ -436,6 +479,10 @@ void runTransformer(Weights* weights, Config* config, State* state){
     delete[] cache.k_cache;
     delete[] cache.v_cache;
     delete[] wo_output;
+    delete[] gate_buffer;
+    delete[] up_buffer;
+    delete[] down_buffer;
+
 }
 
 
@@ -452,11 +499,23 @@ int main() {
 
     std::string input = "Once upon a time";
     
-    encode(input, &tokenizer, &state);
+    encode(input, &tokenizer, &state, &config);
 
-    embedTokens(&weights, &config, &state);
+    int max_tokens = 100;
+    for(int i = 0; i<max_tokens; i++){
+        runTransformer(&weights, &config, &state);
+        int predicted_token = state.input_tokens[state.n_tokens - 1];
 
-    runTransformer(&weights, &config, &state);
+        if (predicted_token == 0) {
+            break; 
+        }
+        
+        std::cout << tokenizer.vocab[predicted_token];
+        std::cout.flush(); 
+    }
+
+
+
 
     return 0;
 }
