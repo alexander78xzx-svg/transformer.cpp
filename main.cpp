@@ -7,11 +7,10 @@
 #include <cstring>
 #include <numeric>
 #include <algorithm>
+#include <omp.h>
 
 #include <chrono>
 #include <ctime>
-
-using Tensor = std::vector<std::vector<float>>; // to refactor later
 
 struct Tokenizer
 {
@@ -271,6 +270,7 @@ void rmsNorm(float* weights, Config *config, float* x, float* xb){
 }
 
 void matmul(float* out, float* x, float* w, int n_out, int n_in) {
+    #pragma omp parallel for // parallelization
     for (int i = 0; i < n_out; i++) {
         float sum = 0.0f;
         for (int j = 0; j < n_in; j++) {
@@ -537,9 +537,9 @@ int main() {
     State state = {};
     state.pos = 0;
 
-    std::string input = "The cat";
-    float temperature = 0.2;
-    int top_k = 10;
+    std::string input = "Once upon a time";
+    float temperature = 0.8;
+    int top_k = 40;
     
     encode(input, &tokenizer, &state, &config);
 
@@ -580,7 +580,7 @@ int main() {
     std::cout<<std::endl<<std::endl;
     std::cout << "Time taken: "
          << time_taken
-         << "seconds, "<< (state.n_tokens - n_tokens_start)  /  time_taken<<" tokens / s" << std::endl << std::endl;
+         << "seconds, "<< int((state.n_tokens - n_tokens_start)  /  time_taken)<<" tokens / s" << std::endl << std::endl;
 
     return 0;
 }
