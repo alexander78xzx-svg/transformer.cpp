@@ -5,6 +5,11 @@
 #include <unordered_map>
 #include <cmath>
 #include <cstring>
+#include <numeric>
+#include <algorithm>
+
+#include <chrono>
+#include <ctime>
 
 using Tensor = std::vector<std::vector<float>>; // to refactor later
 
@@ -62,6 +67,7 @@ struct KV_cache{
 struct State {
     int* input_tokens;
     int n_tokens;
+    int pos;
     float* embeded_input;
 
     float* x;
@@ -76,10 +82,10 @@ struct State {
 
 void loadWeights( Weights *weights, Config *config) {
     
-    std::ifstream file("stories15M.bin", std::ios::binary);
+    std::ifstream file("stories110M.bin", std::ios::binary);
 
     if (!file.is_open()){
-        std::cerr << "Failed to open stories15M.bin." << std::endl;
+        std::cerr << "Failed to open stories110M.bin." << std::endl;
         return;
     }
 
@@ -319,20 +325,29 @@ float SiLU(float x){
     return x * (1 / (1 + exp(-x)));
 }
 
-void runTransformer(Weights* weights, Config* config, State* state){
+void findTopK(std::vector<int>& indices, float* logits, int vocab_size, int k){
+    indices.resize(vocab_size);
+    std::iota(indices.begin(), indices.end(), 0); // populate tokens
+
+    std::partial_sort(
+        indices.begin(),
+        indices.begin() + k,
+        indices.end(),
+        [logits](int a, int b) {
+            return logits[a] > logits[b];
+        }
+    );
+}
+
+void runTransformer(Weights* weights, Config* config, State* state, float temperature, int top_k){
     int head_size = config->dim / config->n_heads;
     int kv_dim = config->n_kv_heads * head_size;
     
-    // one transformer bloc for now
     state->x = new float[config->dim];
     state->x_buffer = new float[config->dim];
     state->q = new float[config->dim];
     state->k = new float[config->dim];
     state->v = new float[config->dim];
-
-    KV_cache cache;
-    cache.k_cache = new float[config->max_context_window * config->n_blocks * kv_dim];
-    cache.v_cache = new float[config->max_context_window * config->n_blocks * kv_dim];
 
     std::vector<float> scores = std::vector<float>(config->max_context_window);
 
@@ -342,7 +357,7 @@ void runTransformer(Weights* weights, Config* config, State* state){
     float* up_buffer   = new float[config->hidden_dim];
     float* down_buffer = new float[config->dim];
 
-    for(int i = 0; i < state->n_tokens; i++){
+    for(int i = state->pos; i < state->n_tokens; i++){
 
         int token_id = state->input_tokens[i];
     
@@ -367,8 +382,8 @@ void runTransformer(Weights* weights, Config* config, State* state){
             int block_offset = layer * config->max_context_window * kv_dim;
             int pos_offset = i * kv_dim;
 
-            float* k_dest = cache.k_cache + block_offset + pos_offset;
-            float* v_dest = cache.v_cache + block_offset + pos_offset;
+            float* k_dest = state->kv_cache->k_cache + block_offset + pos_offset;
+            float* v_dest = state->kv_cache->v_cache + block_offset + pos_offset;
 
             std::memcpy(k_dest, state->k, kv_dim * sizeof(float));
             std::memcpy(v_dest, state->v, kv_dim * sizeof(float));
@@ -382,7 +397,7 @@ void runTransformer(Weights* weights, Config* config, State* state){
                 for(int t = 0; t <= i; t++){
                     float dot_prod = 0;
 
-                    float* k_head = cache.k_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
+                    float* k_head = state->kv_cache->k_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
 
                     for(int j = 0; j<head_size; j++){
                         
@@ -413,7 +428,7 @@ void runTransformer(Weights* weights, Config* config, State* state){
 
                 // attention
                 for(int t = 0; t <= i; t++){
-                    float* v_head = cache.v_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
+                    float* v_head = state->kv_cache->v_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
 
                     for(int j=0; j<head_size; j++){
                         state->x_buffer[h * head_size + j] += scores[t] * v_head[j];
@@ -460,14 +475,39 @@ void runTransformer(Weights* weights, Config* config, State* state){
     float* logits = new float[config->vocab_size];
     matmul(logits, state->x_buffer, weights->wcls, config->vocab_size, config->dim);
 
-    int idx = 0;
-    float max = -std::numeric_limits<float>::infinity();
-    for( int j = 0; j<config->vocab_size; j++){
-        if( logits[j] > max){
-            max = logits[j];
-            idx = j;
+    // temperature sampling
+    for(int j=0; j<config->vocab_size;j++){
+        logits[j] /= temperature;
+    }
+
+    std::vector<int> top_indices;
+    findTopK(top_indices, logits, config->vocab_size, top_k);
+
+    // softmax
+    float max_val = logits[top_indices[0]];
+    
+    std::vector<float> top_probs(top_k);
+    float sum_exp = 0.0f;
+    for (int j = 0; j < top_k; j++) {
+        top_probs[j] = exp(logits[top_indices[j]] - max_val);
+        sum_exp += top_probs[j];
+    }
+    for (int j = 0; j < top_k; j++) {
+        top_probs[j] /= sum_exp;
+    }
+
+    float r = (float)rand() / (float)RAND_MAX;
+    float cdf = 0.0f;
+    int idx = top_indices[top_k - 1];
+
+    for (int j = 0; j < top_k; j++) {
+        cdf += top_probs[j];
+        if (r <= cdf) {
+            idx = top_indices[j];
+            break;
         }
     }
+
     state->input_tokens[state->n_tokens] = idx;
     state->n_tokens++;
 
@@ -476,17 +516,16 @@ void runTransformer(Weights* weights, Config* config, State* state){
     delete[] state->q;
     delete[] state->k;
     delete[] state->v;
-    delete[] cache.k_cache;
-    delete[] cache.v_cache;
     delete[] wo_output;
     delete[] gate_buffer;
     delete[] up_buffer;
     delete[] down_buffer;
+    delete[] logits;
 
 }
 
-
 int main() {
+    srand(time(NULL));
 
     Weights weights;
     Config config;
@@ -495,27 +534,53 @@ int main() {
     Tokenizer tokenizer;
     loadTokenizer(&tokenizer, config.vocab_size);
 
-    State state;
+    State state = {};
+    state.pos = 0;
 
-    std::string input = "Once upon a time";
+    std::string input = "The cat";
+    float temperature = 0.2;
+    int top_k = 10;
     
     encode(input, &tokenizer, &state, &config);
 
-    int max_tokens = 100;
+    int head_size = config.dim / config.n_heads;
+    int kv_dim = config.n_kv_heads * head_size;
+    KV_cache cache;
+    cache.k_cache = new float[config.max_context_window * config.n_blocks * kv_dim];
+    cache.v_cache = new float[config.max_context_window * config.n_blocks * kv_dim];
+    state.kv_cache = &cache;
+
+    int n_tokens_start = state.n_tokens;
+    int max_tokens = config.max_context_window;
+    auto newline = tokenizer.hash_map.find("<0x0A>");
+
+    auto start = std::chrono::high_resolution_clock::now();
+
     for(int i = 0; i<max_tokens; i++){
-        runTransformer(&weights, &config, &state);
+        runTransformer(&weights, &config, &state, temperature, top_k);
+        state.pos = state.n_tokens - 1;
         int predicted_token = state.input_tokens[state.n_tokens - 1];
 
-        if (predicted_token == 0) {
+        if (predicted_token == 0 || predicted_token == 1 || predicted_token == 2) {
             break; 
+        }
+        if (predicted_token == newline->second){
+            std::cout<<std::endl;
+            continue;
         }
         
         std::cout << tokenizer.vocab[predicted_token];
         std::cout.flush(); 
     }
 
+    auto stop = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
 
-
+    float time_taken = duration.count() / 1000000.0f;
+    std::cout<<std::endl<<std::endl;
+    std::cout << "Time taken: "
+         << time_taken
+         << "seconds, "<< (state.n_tokens - n_tokens_start)  /  time_taken<<" tokens / s" << std::endl << std::endl;
 
     return 0;
 }
