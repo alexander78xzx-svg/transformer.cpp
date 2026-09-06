@@ -9,6 +9,12 @@
 #include <algorithm>
 #include <omp.h>
 
+// mmap
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <ctime>
 
@@ -39,6 +45,9 @@ struct Config
 
 struct Weights
 {
+    void* mmap_ptr;
+    size_t mmap_size;
+    
     float* token_embedding_table; // total representation of tokens by vectors
 
     // attention weights
@@ -58,53 +67,71 @@ struct Weights
     float* wcls;
 };
 
-struct KV_cache{
-    float* k_cache;
-    float* v_cache;
-};
-
 struct State {
-    int* input_tokens;
+    std::vector<int> input_tokens;
     int n_tokens;
     int pos;
-    float* embeded_input;
+    std::vector<float> embeded_input;
 
-    float* x;
-    float* x_buffer;
-    float* q;
-    float* k;
-    float* v;
+    std::vector<float> x;
+    std::vector<float> x_buffer;
+    std::vector<float> q;
+    std::vector<float> k;
+    std::vector<float> v;
 
-    KV_cache* kv_cache;
+    std::vector<float> k_cache;
+    std::vector<float> v_cache;
+    std::vector<float> logits;
+    std::vector<float> gate_buffer;
+    std::vector<float> up_buffer;
+    std::vector<float> down_buffer;
+    std::vector<float> wo_output;
+
+    State(int dim, int hidden_dim, int n_layers, int seq_len, int n_kv_heads, int head_size, int vocab_size) : 
+        x(dim),
+        x_buffer(dim),
+        q(dim),
+        k(dim),
+        v(dim),
+        logits(vocab_size),
+        k_cache(n_layers * seq_len * n_kv_heads * head_size),
+        v_cache(n_layers * seq_len * n_kv_heads * head_size),
+        gate_buffer(hidden_dim),
+        up_buffer(hidden_dim),
+        down_buffer(dim),
+        wo_output(dim) {}
 };
 
-
-void loadWeights( Weights *weights, Config *config) {
-    
-    std::ifstream file("stories110M.bin", std::ios::binary);
-
-    if (!file.is_open()){
+void loadWeights(Weights* weights, Config* config, const std::string& model_name) {
+    int fd = open(model_name.c_str(), O_RDONLY);
+    if (fd == -1) {
         std::cerr << "Failed to open stories110M.bin." << std::endl;
-        return;
+        exit(1);
     }
 
-    file.read(reinterpret_cast<char*>(config), sizeof(Config)); // reinterpret_cast<char*> marks &config as *char for the compiler
+    //file size
+    struct stat sb;
+    if (fstat(fd, &sb) == -1) {
+        std::cerr << "Failed to get file size." << std::endl;
+        exit(1);
+    }
+    weights->mmap_size = sb.st_size;
 
-    // handle sign of vocab size
+
+    weights->mmap_ptr = mmap(NULL, weights->mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (weights->mmap_ptr == MAP_FAILED) {
+        std::cerr << "mmap failed." << std::endl;
+        exit(1);
+    }
+    close(fd);
+
+    std::memcpy(config, weights->mmap_ptr, sizeof(Config));
+
     int shared_weights = config->vocab_size > 0 ? 1 : 0;
     config->vocab_size = std::abs(config->vocab_size);
-    
-    file.seekg(0, std::ios::end); // we jump to the end of the file to measure total size
-    size_t file_size = file.tellg(); // calculate file size in byte
-    size_t weights_size = file_size - sizeof(Config);
-    size_t num_floats = weights_size / sizeof(float);
 
-    file.seekg(sizeof(Config), std::ios::beg);
 
-    float* data = new float[num_floats]; // allocate memory for all weights
-    file.read(reinterpret_cast<char*>(data), weights_size);
-
-    float* ptr = data; // tracking pointer
+    float* ptr = (float*)((char*)weights->mmap_ptr + sizeof(Config)); // tracking pointer
 
     int head_size = config->dim / config->n_heads;
 
@@ -130,18 +157,15 @@ void loadWeights( Weights *weights, Config *config) {
 
     weights->rms_final_weight = ptr; ptr += config->dim;
 
-
-
     if (shared_weights) {
         weights->wcls = weights->token_embedding_table;
     } else {
         weights->wcls = ptr; 
-        ptr += (size_t)config->vocab_size * config->dim;
     }
 }
 
-void loadTokenizer( Tokenizer* tokenizer, int vocab_size ){
-    std::ifstream file("tokenizer.bin", std::ios::binary);
+void loadTokenizer( Tokenizer* tokenizer, int vocab_size , std::string tokenizer_name){
+    std::ifstream file(tokenizer_name, std::ios::binary);
 
     if (!file.is_open()){
         std::cerr << "Failed to open tokenizer.bin." << std::endl;
@@ -221,7 +245,7 @@ void encode(std::string input, Tokenizer* tokenizer, State* state, Config* confi
     std::cout<<std::endl;
 
     state->n_tokens = 0;
-    state->input_tokens = new int[config->max_context_window];
+    state->input_tokens.resize(config->max_context_window);
 
     state->input_tokens[state->n_tokens] = 1;
     state->n_tokens++;
@@ -233,20 +257,6 @@ void encode(std::string input, Tokenizer* tokenizer, State* state, Config* confi
             state->n_tokens++;
         }
   
-    }
-}
-
-void embedTokens( Weights* weights, Config *config, State* state ) {
-    state->embeded_input = new float[state->n_tokens * config->dim];
-
-    float* ptr = state->embeded_input;
-
-    for(int i = 0; i< state->n_tokens; i++){
-        float* src = weights->token_embedding_table + ((size_t)state->input_tokens[i] * config->dim);
-
-        std::memcpy(ptr, src, config->dim * sizeof(float));
-
-        ptr += config->dim;
     }
 }
 
@@ -285,10 +295,9 @@ void computeQKV(float* wq, float* wk, float* wv, Config* config , State *state){
     int head_size = dim / config->n_heads;
     int kv_dim = config->n_kv_heads * head_size;
 
-    matmul(state->q, state->x_buffer, wq, dim, dim);
-
-    matmul(state->k, state->x_buffer, wk, kv_dim, dim);
-    matmul(state->v, state->x_buffer, wv, kv_dim, dim);
+    matmul(state->q.data(), state->x_buffer.data(), wq, dim, dim);
+    matmul(state->k.data(), state->x_buffer.data(), wk, kv_dim, dim);
+    matmul(state->v.data(), state->x_buffer.data(), wv, kv_dim, dim);
 }
 
 void applyRoPE( float* q, float* k, int pos, Config* config){ 
@@ -343,26 +352,14 @@ void runTransformer(Weights* weights, Config* config, State* state, float temper
     int head_size = config->dim / config->n_heads;
     int kv_dim = config->n_kv_heads * head_size;
     
-    state->x = new float[config->dim];
-    state->x_buffer = new float[config->dim];
-    state->q = new float[config->dim];
-    state->k = new float[config->dim];
-    state->v = new float[config->dim];
-
     std::vector<float> scores = std::vector<float>(config->max_context_window);
-
-    float* wo_output = new float[config->dim];
-
-    float* gate_buffer = new float[config->hidden_dim];
-    float* up_buffer   = new float[config->hidden_dim];
-    float* down_buffer = new float[config->dim];
 
     for(int i = state->pos; i < state->n_tokens; i++){
 
         int token_id = state->input_tokens[i];
     
         float* token_embed = weights->token_embedding_table + (token_id * config->dim);
-        std::memcpy(state->x, token_embed, config->dim * sizeof(float));
+        std::memcpy(state->x.data(), token_embed, config->dim * sizeof(float));
 
         for(int layer = 0; layer<config->n_blocks; layer++){
             float* rms_weight_att = weights->rms_att_weight + (layer * config->dim);
@@ -372,32 +369,32 @@ void runTransformer(Weights* weights, Config* config, State* state, float temper
             float* k_layer = weights->wk + (size_t)layer * (config->dim*kv_dim);
             float* v_layer = weights->wv + (size_t)layer * (config->dim*kv_dim);
 
-            rmsNorm( rms_weight_att, config, state->x, state->x_buffer);
+            rmsNorm( rms_weight_att, config, state->x.data(), state->x_buffer.data());
 
             computeQKV( q_layer, k_layer, v_layer, config, state );
 
-            applyRoPE(state->q, state->k, i, config);
+            applyRoPE(state->q.data(), state->k.data(), i, config);
 
 
             int block_offset = layer * config->max_context_window * kv_dim;
             int pos_offset = i * kv_dim;
 
-            float* k_dest = state->kv_cache->k_cache + block_offset + pos_offset;
-            float* v_dest = state->kv_cache->v_cache + block_offset + pos_offset;
+            float* k_dest = state->k_cache.data() + block_offset + pos_offset;
+            float* v_dest = state->v_cache.data() + block_offset + pos_offset;
 
-            std::memcpy(k_dest, state->k, kv_dim * sizeof(float));
-            std::memcpy(v_dest, state->v, kv_dim * sizeof(float));
+            std::memcpy(k_dest, state->k.data(), kv_dim * sizeof(float));
+            std::memcpy(v_dest, state->v.data(), kv_dim * sizeof(float));
 
             for(int h = 0; h < config->n_heads; h++){
 
-                float* slice_q = state->q + h * head_size;
+                float* slice_q = state->q.data() + h * head_size;
                 int kv_head = h / (config->n_heads / config->n_kv_heads);
 
                 // dot prod
                 for(int t = 0; t <= i; t++){
                     float dot_prod = 0;
 
-                    float* k_head = state->kv_cache->k_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
+                    float* k_head = state->k_cache.data() + block_offset + (t * kv_dim) + (kv_head * head_size);
 
                     for(int j = 0; j<head_size; j++){
                         
@@ -421,14 +418,14 @@ void runTransformer(Weights* weights, Config* config, State* state, float temper
                 for(int j = 0; j<=i; j++){ scores[j] /= sum_exp; }
 
                 // clean buffer
-                float* head_offset = state->x_buffer + (head_size * h);
+                float* head_offset = state->x_buffer.data() + (head_size * h);
                 for(int j = 0; j < head_size; j++){
                     head_offset[j] = 0.0f;
                 }
 
                 // attention
                 for(int t = 0; t <= i; t++){
-                    float* v_head = state->kv_cache->v_cache + block_offset + (t * kv_dim) + (kv_head * head_size);
+                    float* v_head = state->v_cache.data() + block_offset + (t * kv_dim) + (kv_head * head_size);
 
                     for(int j=0; j<head_size; j++){
                         state->x_buffer[h * head_size + j] += scores[t] * v_head[j];
@@ -438,14 +435,14 @@ void runTransformer(Weights* weights, Config* config, State* state, float temper
 
             // wo and add
             float* wo_offset = weights->wo + (size_t)layer * (config->dim * config->dim);
-            matmul(wo_output,state->x_buffer,wo_offset, config->dim, config->dim);
+            matmul(state->wo_output.data(), state->x_buffer.data(),wo_offset, config->dim, config->dim);
 
             for(int j = 0; j<config->dim; j++){
-                state->x[j] += wo_output[j]; 
+                state->x[j] += state->wo_output[j]; 
             }
 
             // pre ffn norm
-            rmsNorm(rms_weight_ffn, config, state->x, state->x_buffer);
+            rmsNorm(rms_weight_ffn, config, state->x.data(), state->x_buffer.data());
 
             //ffn:
             int token = state->input_tokens[i];
@@ -453,43 +450,42 @@ void runTransformer(Weights* weights, Config* config, State* state, float temper
             float* w3_offset = weights->w3 + (size_t)layer * (config->dim * config->hidden_dim);
             float* w2_offset = weights->w2 + (size_t)layer * (config->hidden_dim * config->dim);
 
-            matmul(gate_buffer, state->x_buffer, w1_offset, config->hidden_dim, config->dim);
+            matmul(state->gate_buffer.data(), state->x_buffer.data(), w1_offset, config->hidden_dim, config->dim);
             for(int j= 0; j<config->hidden_dim; j++){
-                gate_buffer[j] = SiLU(gate_buffer[j]);
+                state->gate_buffer[j] = SiLU(state->gate_buffer[j]);
             }
-            matmul(up_buffer, state->x_buffer, w3_offset, config->hidden_dim, config->dim);
+            matmul(state->up_buffer.data(), state->x_buffer.data(), w3_offset, config->hidden_dim, config->dim);
             for(int j = 0; j<config->hidden_dim; j++){
-                gate_buffer[j] = gate_buffer[j] * up_buffer[j];
+                state->gate_buffer[j] = state->gate_buffer[j] * state->up_buffer[j];
             }
-            matmul(down_buffer,gate_buffer,w2_offset,config->dim, config->hidden_dim);
+            matmul(state->down_buffer.data(), state->gate_buffer.data(),w2_offset,config->dim, config->hidden_dim);
             for(int j=0; j<config->dim; j++){
-                state->x[j] += down_buffer[j];
+                state->x[j] += state->down_buffer[j];
             }            
         }
     }
 
     // final norm
     float* rms_weight_final = weights->rms_final_weight;
-    rmsNorm(rms_weight_final,config,state->x, state->x_buffer);
+    rmsNorm(rms_weight_final,config,state->x.data(), state->x_buffer.data());
 
-    float* logits = new float[config->vocab_size];
-    matmul(logits, state->x_buffer, weights->wcls, config->vocab_size, config->dim);
+    matmul(state->logits.data(), state->x_buffer.data(), weights->wcls, config->vocab_size, config->dim);
 
     // temperature sampling
     for(int j=0; j<config->vocab_size;j++){
-        logits[j] /= temperature;
+        state->logits[j] /= temperature;
     }
 
     std::vector<int> top_indices;
-    findTopK(top_indices, logits, config->vocab_size, top_k);
+    findTopK(top_indices, state->logits.data(), config->vocab_size, top_k);
 
     // softmax
-    float max_val = logits[top_indices[0]];
+    float max_val = state->logits[top_indices[0]];
     
     std::vector<float> top_probs(top_k);
     float sum_exp = 0.0f;
     for (int j = 0; j < top_k; j++) {
-        top_probs[j] = exp(logits[top_indices[j]] - max_val);
+        top_probs[j] = exp(state->logits[top_indices[j]] - max_val);
         sum_exp += top_probs[j];
     }
     for (int j = 0; j < top_k; j++) {
@@ -510,48 +506,38 @@ void runTransformer(Weights* weights, Config* config, State* state, float temper
 
     state->input_tokens[state->n_tokens] = idx;
     state->n_tokens++;
-
-    delete[] state->x;
-    delete[] state->x_buffer;
-    delete[] state->q;
-    delete[] state->k;
-    delete[] state->v;
-    delete[] wo_output;
-    delete[] gate_buffer;
-    delete[] up_buffer;
-    delete[] down_buffer;
-    delete[] logits;
-
 }
 
 int main() {
+    std::string model_name = "stories110M.bin";
+    std::string tokenizer_name = "tokenizer.bin";
+
+    std::string input = "Once upon a time ";
+    float temperature = 0.3;
+    int top_k = 20;
+
+
     srand(time(NULL));
 
     Weights weights;
     Config config;
-    loadWeights(&weights, &config);
+    loadWeights(&weights, &config, model_name);
 
     Tokenizer tokenizer;
-    loadTokenizer(&tokenizer, config.vocab_size);
-
-    State state = {};
-    state.pos = 0;
-
-    std::string input = "Once upon a time";
-    float temperature = 0.8;
-    int top_k = 40;
-    
-    encode(input, &tokenizer, &state, &config);
+    loadTokenizer(&tokenizer, config.vocab_size, tokenizer_name);
 
     int head_size = config.dim / config.n_heads;
-    int kv_dim = config.n_kv_heads * head_size;
-    KV_cache cache;
-    cache.k_cache = new float[config.max_context_window * config.n_blocks * kv_dim];
-    cache.v_cache = new float[config.max_context_window * config.n_blocks * kv_dim];
-    state.kv_cache = &cache;
 
-    int n_tokens_start = state.n_tokens;
+    State state(config.dim, config.hidden_dim, config.n_blocks, 
+                config.max_context_window, config.n_kv_heads, head_size, config.vocab_size);
+    state.pos = 0;
+
+
+
+    
+    encode(input, &tokenizer, &state, &config);
     int max_tokens = config.max_context_window;
+    int n_tokens_start = state.n_tokens;
     auto newline = tokenizer.hash_map.find("<0x0A>");
 
     auto start = std::chrono::high_resolution_clock::now();
@@ -582,5 +568,6 @@ int main() {
          << time_taken
          << "seconds, "<< int((state.n_tokens - n_tokens_start)  /  time_taken)<<" tokens / s" << std::endl << std::endl;
 
+    munmap(weights.mmap_ptr, weights.mmap_size);
     return 0;
 }

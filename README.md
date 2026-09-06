@@ -17,6 +17,7 @@ A high-performance, zero-dependency LLaMA-style Transformer inference engine imp
 * **Persistent KV Caching:** Eliminates redundant forward passes over prior context, preserving attention states across inference steps.
 * **Optimized Top-K Temperature Sampler:** Uses `std::partial_sort` over vocabulary indices to achieve $\mathcal{O}(N \log K)$ selection without allocating full mapping structures per step.
 * **Multi-Threaded Acceleration:** Parallelized matrix-vector multiplication via OpenMP across all available physical and efficiency cores.
+* **Zero-Copy Weight Loading:** Replaced standard file stream reading with POSIX mmap, mapping model weights directly into virtual memory for nearly instant startup times.
 * **Single-Unit Portability:** Built as a standalone binary with zero external dependencies beyond standard libc/libomp.
 ---
 ## Architecture
@@ -46,7 +47,7 @@ Benchmarked on **Apple M5** using the **Stories-110M** checkpoint in full single
 # 1. Download the tokenizer binary
 curl -O https://github.com/karpathy/llama2.c/raw/master/tokenizer.bin
 
-# 2. Download the Stories-110M model weights (~440 MB )
+# 2. Download the Stories-110M model weights (440 MB)
 curl -L -O https://huggingface.co/karpathy/tinyllamas/resolve/main/stories110M.bin
 ```
 ## Compilation
